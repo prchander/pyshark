@@ -1,6 +1,7 @@
-import os
+import pathlib
 
 from pyshark.capture.capture import Capture
+from pyshark.packet.packet import Packet
 
 
 class FileCapture(Capture):
@@ -9,7 +10,8 @@ class FileCapture(Capture):
     def __init__(self, input_file=None, keep_packets=True, display_filter=None, only_summaries=False,
                  decryption_key=None, encryption_type="wpa-pwk", decode_as=None,
                  disable_protocol=None, tshark_path=None, override_prefs=None,
-                 use_json=False, output_file=None, include_raw=False, eventloop=None, custom_parameters=None,
+                 use_json=False, use_ek=False,
+                 output_file=None, include_raw=False, eventloop=None, custom_parameters=None,
                  debug=False):
         """Creates a packet capture object by reading from file.
 
@@ -27,30 +29,29 @@ class FileCapture(Capture):
         :param tshark_path: Path of the tshark binary
         :param override_prefs: A dictionary of tshark preferences to override, {PREFERENCE_NAME: PREFERENCE_VALUE, ...}.
         :param disable_protocol: Tells tshark to remove a dissector for a specific protocol.
-        :param use_json: Uses tshark in JSON mode (EXPERIMENTAL). It is a good deal faster than XML
-        but also has less information. Available from Wireshark 2.2.0.
+        :param use_ek: Uses tshark in EK JSON mode. It is faster than XML but has slightly less data.
+        :param use_json: DEPRECATED. Use use_ek instead.
         :param output_file: A string of a file to write every read packet into (useful when filtering).
         :param custom_parameters: A dict of custom parameters to pass to tshark, i.e. {"--param": "value"}
+        or else a list of parameters in the format ["--foo", "bar", "--baz", "foo"].
         """
         super(FileCapture, self).__init__(display_filter=display_filter, only_summaries=only_summaries,
                                           decryption_key=decryption_key, encryption_type=encryption_type,
                                           decode_as=decode_as, disable_protocol=disable_protocol,
-                                          tshark_path=tshark_path,override_prefs=override_prefs,
-                                          use_json=use_json, output_file=output_file,
+                                          tshark_path=tshark_path, override_prefs=override_prefs,
+                                          use_json=use_json, use_ek=use_ek, output_file=output_file,
                                           include_raw=include_raw, eventloop=eventloop,
                                           custom_parameters=custom_parameters, debug=debug)
-        self.input_filename = input_file
-        if not isinstance(input_file, str):
-            self.input_filename = input_file.name
-        if not os.path.exists(self.input_filename):
-            raise FileNotFoundError(
-                    "[Errno 2] No such file or directory: "
-                    + str(self.input_filename)
-                    )
+        self.input_filepath = pathlib.Path(input_file)
+        if not self.input_filepath.exists():
+            raise FileNotFoundError(f"[Errno 2] No such file or directory: {self.input_filepath}")
+        if not self.input_filepath.is_file():
+            raise FileNotFoundError(f"{self.input_filepath} is a directory")
+
         self.keep_packets = keep_packets
         self._packet_generator = self._packets_from_tshark_sync()
 
-    def next(self):
+    def next(self) -> Packet:
         """Returns the next packet in the cap.
 
         If the capture's keep_packets flag is True, will also keep it in the internal packet list.
@@ -71,14 +72,22 @@ class FileCapture(Capture):
                 self.next()
             except StopIteration:
                 # We read the whole file, and there's still not such packet.
-                raise KeyError("Packet of index %d does not exist in capture" % packet_index)
+                raise KeyError(f"Packet of index {packet_index} does not exist in capture")
         return super(FileCapture, self).__getitem__(packet_index)
 
     def get_parameters(self, packet_count=None):
-        return super(FileCapture, self).get_parameters(packet_count=packet_count) + ["-r", self.input_filename]
+        return super(FileCapture, self).get_parameters(packet_count=packet_count) + [
+            "-r", self.input_filepath.as_posix()]
+
+    def _verify_capture_parameters(self):
+        try:
+            with self.input_filepath.open("rb"):
+                pass
+        except PermissionError:
+            raise PermissionError(f"Permission denied for file {self.input_filepath}")
 
     def __repr__(self):
         if self.keep_packets:
-            return "<%s %s>" % (self.__class__.__name__, self.input_filename)
+            return f"<{self.__class__.__name__} {self.input_filepath.as_posix()}>"
         else:
-            return "<%s %s (%d packets)>" % (self.__class__.__name__, self.input_filename, len(self._packets))
+            return f"<{self.__class__.__name__} {self.input_filepath.as_posix()} ({len(self._packets)} packets)>"

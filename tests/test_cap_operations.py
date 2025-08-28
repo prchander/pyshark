@@ -1,14 +1,12 @@
-try:
-    import mock
-except ModuleNotFoundError:
-    from unittest import mock
 import time
-import pytest
-from multiprocessing import Process, Queue
-from multiprocessing.queues import Empty
 from asyncio import TimeoutError
+from multiprocessing import Process
+from multiprocessing import Queue
+from multiprocessing.queues import Empty
+from unittest import mock
 
-import sys
+import pytest
+
 from pyshark.packet.packet_summary import PacketSummary
 
 
@@ -17,6 +15,14 @@ def test_packet_callback_called_for_each_packet(lazy_simple_capture):
     mock_callback = mock.Mock()
     lazy_simple_capture.apply_on_packets(mock_callback)
     assert mock_callback.call_count == 24
+
+
+def test_async_packet_callback_called_for_each_packet(lazy_simple_capture):
+    # Test cap has 24 packets
+    mock_callback = mock.AsyncMock()
+    lazy_simple_capture.apply_on_packets(mock_callback)
+    assert mock_callback.call_count == 24
+    mock_callback.assert_awaited()
 
 
 def test_apply_on_packet_stops_on_timeout(lazy_simple_capture):
@@ -54,18 +60,17 @@ def test_getting_packet_summary(simple_summary_capture):
     assert simple_summary_capture[0]._fields
 
 
-
 def _iterate_capture_object(cap_obj, q):
-    for packet in cap_obj:
+    for _ in cap_obj:
         pass
     q.put(True)
 
 
-@pytest.mark.skip(reason="Don't know how to fix")
 def test_iterate_empty_psml_capture(simple_summary_capture):
-    # simple_summary_capture.display_filter = "frame.len == 1"
+    simple_summary_capture.display_filter = "frame.len == 1"
     q = Queue()
-    p = Process(target=_iterate_capture_object, args=(simple_summary_capture, q))
+    p = Process(target=_iterate_capture_object,
+                args=(simple_summary_capture, q))
     p.start()
     p.join(2)
     try:
@@ -74,4 +79,4 @@ def test_iterate_empty_psml_capture(simple_summary_capture):
         no_hang = False
     if p.is_alive():
         p.terminate()
-    assert no_hang # False here
+    assert no_hang  # False here

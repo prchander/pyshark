@@ -1,16 +1,21 @@
 import asyncio
+import contextlib
+import inspect
 import os
 import threading
 import subprocess
 import concurrent.futures
 import sys
 import logging
-from distutils.version import LooseVersion
+import warnings
 
+from pyshark import ek_field_mapping
+from pyshark.packet.packet import Packet
+from pyshark.tshark.output_parser import tshark_ek
+from pyshark.tshark.output_parser import tshark_json
+from pyshark.tshark.output_parser import tshark_xml
 from pyshark.tshark.tshark import get_process_path, get_tshark_display_filter_flag, \
     tshark_supports_json, TSharkVersionException, get_tshark_version, tshark_supports_duplicate_keys
-from pyshark.tshark.tshark_json import packet_from_json_packet
-from pyshark.tshark.tshark_xml import packet_from_xml_packet, psml_structure_from_xml
 
 
 if sys.version_info < (3, 8):
@@ -18,11 +23,12 @@ if sys.version_info < (3, 8):
 else:
     asyncTimeoutError = asyncio.exceptions.TimeoutError
 
+
 class TSharkCrashException(Exception):
     pass
 
 
-class UnknownEncyptionStandardException(Exception):
+class UnknownEncryptionStandardException(Exception):
     pass
 
 
@@ -35,9 +41,8 @@ class StopCapture(Exception):
     pass
 
 
-class Capture(object):
+class Capture:
     """Base class for packet captures."""
-    DEFAULT_BATCH_SIZE = 2 ** 16
     SUMMARIES_BATCH_SIZE = 64
     DEFAULT_LOG_LEVEL = logging.CRITICAL
     SUPPORTED_ENCRYPTION_STANDARDS = ["wep", "wpa-pwk", "wpa-pwd", "wpa-psk"]
@@ -46,13 +51,14 @@ class Capture(object):
                  decryption_key=None, encryption_type="wpa-pwd", output_file=None,
                  decode_as=None,  disable_protocol=None, tshark_path=None,
                  override_prefs=None, capture_filter=None, use_json=False, include_raw=False,
-                 custom_parameters=None, debug=False):
+                 use_ek=False, custom_parameters=None, debug=False):
 
         self.loaded = False
         self.tshark_path = tshark_path
         self._override_prefs = override_prefs
         self.debug = debug
         self.use_json = use_json
+        self._use_ek = use_ek
         self.include_raw = include_raw
         self._packets = []
         self._current_packet = 0
@@ -63,15 +69,18 @@ class Capture(object):
         self._running_processes = set()
         self._decode_as = decode_as
         self._disable_protocol = disable_protocol
-        self._json_has_duplicate_keys = True
-        self._log = logging.Logger(self.__class__.__name__, level=self.DEFAULT_LOG_LEVEL)
+        self._log = logging.Logger(
+            self.__class__.__name__, level=self.DEFAULT_LOG_LEVEL)
         self._closed = False
         self._custom_parameters = custom_parameters
         self._eof_reached = False
+        self._last_error_line = None
+        self._stderr_handling_tasks = []
         self.__tshark_version = None
 
-        if include_raw and not use_json:
-            raise RawMustUseJsonException("use_json must be True if include_raw")
+        if include_raw and not (use_json or use_ek):
+            raise RawMustUseJsonException(
+                "use_json/use_ek must be True if include_raw")
 
         if self.debug:
             self.set_debug()
@@ -82,8 +91,8 @@ class Capture(object):
         if encryption_type and encryption_type.lower() in self.SUPPORTED_ENCRYPTION_STANDARDS:
             self.encryption = (decryption_key, encryption_type.lower())
         else:
-            raise UnknownEncyptionStandardException("Only the following standards are supported: %s."
-                                                    % ", ".join(self.SUPPORTED_ENCRYPTION_STANDARDS))
+            standards = ", ".join(self.SUPPORTED_ENCRYPTION_STANDARDS)
+            raise UnknownEncryptionStandardException(f"Only the following standards are supported: {standards}.")
 
     def __getitem__(self, item):
         """Gets the packet in the given index.
@@ -96,12 +105,12 @@ class Capture(object):
     def __len__(self):
         return len(self._packets)
 
-    def next(self):
+    def next(self) -> Packet:
         return self.next_packet()
 
     # Allows for child classes to call next() from super() without 2to3 "fixing"
     # the call
-    def next_packet(self):
+    def next_packet(self) -> Packet:
         if self._current_packet >= len(self._packets):
             raise StopIteration()
         cur_packet = self._packets[self._current_packet]
@@ -134,7 +143,8 @@ class Capture(object):
                 raise StopCapture()
 
         try:
-            self.apply_on_packets(keep_packet, timeout=timeout, packet_count=packet_count)
+            self.apply_on_packets(
+                keep_packet, timeout=timeout, packet_count=packet_count)
             self.loaded = True
         except asyncTimeoutError:
             pass
@@ -143,18 +153,36 @@ class Capture(object):
         """Sets the capture to debug mode (or turns it off if specified)."""
         if set_to:
             handler = logging.StreamHandler(sys.stdout)
-            handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
             self._log.addHandler(handler)
             self._log.level = log_level
         self.debug = set_to
 
+    def _verify_capture_parameters(self):
+        """Optionally verify that the capture's parameters are valid.
+
+        Should raise an exception if they are not valid.
+        """
+        pass
+
     def _setup_eventloop(self):
         """Sets up a new eventloop as the current one according to the OS."""
         if os.name == "nt":
-            self.eventloop = asyncio.ProactorEventLoop()
+            current_eventloop = asyncio.get_event_loop_policy().get_event_loop()
+            if isinstance(current_eventloop, asyncio.ProactorEventLoop):
+                self.eventloop = current_eventloop
+            else:
+                # On Python before 3.8, Proactor is not the default eventloop type, so we have to create a new one.
+                # If there was an existing eventloop this can create issues, since we effectively disable it here.
+                if asyncio.all_tasks():
+                    warnings.warn("The running eventloop has tasks but pyshark must set a new eventloop to continue. "
+                                  "Existing tasks may not run.")
+                self.eventloop = asyncio.ProactorEventLoop()
+                asyncio.set_event_loop(self.eventloop)
         else:
             try:
-                self.eventloop = asyncio.get_event_loop()
+                self.eventloop = asyncio.get_event_loop_policy().get_event_loop()
             except RuntimeError:
                 if threading.current_thread() != threading.main_thread():
                     # Ran not in main thread, make a new eventloop
@@ -162,63 +190,17 @@ class Capture(object):
                     asyncio.set_event_loop(self.eventloop)
                 else:
                     raise
-        if os.name == "posix" and isinstance(threading.current_thread(), threading._MainThread):
-            asyncio.get_child_watcher().attach_loop(self.eventloop)
-
-    def _get_json_separators(self):
-        """"Returns the separators between packets in a JSON output
-
-        Returns a tuple of (packet_separator, end_of_file_separator, characters_to_disregard).
-        The latter variable being the number of characters to ignore in order to pass the packet (i.e. extra newlines,
-        commas, parenthesis).
-        """
-        if self._get_tshark_version() >= LooseVersion("3.0.0"):
-            return ("%s  },%s" % (os.linesep, os.linesep)).encode(), ("}%s]" % os.linesep).encode(), (
-                    1 + len(os.linesep))
-        else:
-            return ("}%s%s  ," % (os.linesep, os.linesep)).encode(), ("}%s%s]" % (os.linesep, os.linesep)).encode(), 1
-
-    def _extract_packet_json_from_data(self, data, got_first_packet=True):
-        tag_start = 0
-        if not got_first_packet:
-            tag_start = data.find(b"{")
-            if tag_start == -1:
-                return None, data
-        packet_separator, end_separator, end_tag_strip_length = self._get_json_separators()
-        found_separator = None
-
-        tag_end = data.find(packet_separator)
-        if tag_end == -1:
-            # Not end of packet, maybe it has end of entire file?
-            tag_end = data.find(end_separator)
-            if tag_end != -1:
-                found_separator = end_separator
-        else:
-            # Found a single packet, just add the separator without extras
-            found_separator = packet_separator
-
-        if found_separator:
-            tag_end += len(found_separator) - end_tag_strip_length
-            return data[tag_start:tag_end].strip().strip(b","), data[tag_end + 1:]
-        return None, data
-
-    def _extract_tag_from_data(self, data, tag_name=b"packet"):
-        """Gets data containing a (part of) tshark xml.
-
-        If the given tag is found in it, returns the tag data and the remaining data.
-        Otherwise returns None and the same data.
-
-        :param data: string of a partial tshark xml.
-        :return: a tuple of (tag, data). tag will be None if none is found.
-        """
-        opening_tag = b"<" + tag_name + b">"
-        closing_tag = opening_tag.replace(b"<", b"</")
-        tag_end = data.find(closing_tag)
-        if tag_end != -1:
-            tag_end += len(closing_tag)
-            tag_start = data.find(opening_tag)
-            return data[tag_start:tag_end], data[tag_end:]
-        return None, data
+            if os.name == "posix" and isinstance(threading.current_thread(), threading._MainThread):
+                # The default child watchers (ThreadedChildWatcher) attach_loop method is empty!
+                # While using pyshark with ThreadedChildWatcher, asyncio could raise a ChildProcessError
+                # "Unknown child process pid %d, will report returncode 255"
+                # This led to a TSharkCrashException in _cleanup_subprocess.
+                # Using the SafeChildWatcher fixes this issue, but it is slower.
+                # SafeChildWatcher O(n) -> large numbers of processes are slow
+                # ThreadedChildWatcher O(1) -> independent of process number
+                # asyncio.get_child_watcher().attach_loop(self.eventloop)
+                asyncio.set_child_watcher(asyncio.SafeChildWatcher())
+                asyncio.get_child_watcher().attach_loop(self.eventloop)
 
     def _packets_from_tshark_sync(self, packet_count=None, existing_process=None):
         """Returns a generator of packets.
@@ -229,8 +211,9 @@ class Capture(object):
         :param packet_count: If given, stops after this amount of packets is captured.
         """
         # NOTE: This has code duplication with the async version, think about how to solve this
-        tshark_process = existing_process or self.eventloop.run_until_complete(self._get_tshark_process())
-        psml_structure, data = self.eventloop.run_until_complete(self._get_psml_struct(tshark_process.stdout))
+        tshark_process = existing_process or self.eventloop.run_until_complete(
+            self._get_tshark_process())
+        parser = self._setup_tshark_output_parser()
         packets_captured = 0
 
         data = b""
@@ -238,8 +221,8 @@ class Capture(object):
             while True:
                 try:
                     packet, data = self.eventloop.run_until_complete(
-                        self._get_packet_from_stream(tshark_process.stdout, data, psml_structure=psml_structure,
-                                                     got_first_packet=packets_captured > 0))
+                        parser.get_packets_from_stream(tshark_process.stdout, data,
+                                                       got_first_packet=packets_captured > 0))
 
                 except EOFError:
                     self._log.debug("EOF reached (sync)")
@@ -253,11 +236,12 @@ class Capture(object):
                     break
         finally:
             if tshark_process in self._running_processes:
-                self.eventloop.run_until_complete(self._cleanup_subprocess(tshark_process))
+                self.eventloop.run_until_complete(
+                    self._cleanup_subprocess(tshark_process))
 
     def apply_on_packets(self, callback, timeout=None, packet_count=None):
         """Runs through all packets and calls the given callback (a function) with each one as it is read.
-        
+
         If the capture is infinite (i.e. a live capture), it will run forever, otherwise it will complete after all
         packets have been read.
 
@@ -294,12 +278,13 @@ class Capture(object):
         packets_captured = 0
         self._log.debug("Starting to go through packets")
 
-        psml_struct, data = await self._get_psml_struct(fd)
+        parser = self._setup_tshark_output_parser()
+        data = b""
 
         while True:
             try:
-                packet, data = await self._get_packet_from_stream(fd, data, got_first_packet=packets_captured > 0,
-                                                                  psml_structure=psml_struct)
+                packet, data = await parser.get_packets_from_stream(fd, data,
+                                                                    got_first_packet=packets_captured > 0)
             except EOFError:
                 self._log.debug("EOF reached")
                 self._eof_reached = True
@@ -308,7 +293,10 @@ class Capture(object):
             if packet:
                 packets_captured += 1
                 try:
-                    packet_callback(packet)
+                    if inspect.iscoroutinefunction(packet_callback):
+                        await packet_callback(packet)
+                    else:
+                        packet_callback(packet)
                 except StopCapture:
                     self._log.debug("User-initiated capture stop in callback")
                     break
@@ -316,65 +304,20 @@ class Capture(object):
             if packet_count and packets_captured >= packet_count:
                 break
 
-    async def _get_psml_struct(self, fd):
-        """Gets the current PSML (packet summary xml) structure in a tuple ((None, leftover_data)),
-        only if the capture is configured to return it, else returns (None, leftover_data).
+    def _create_stderr_handling_task(self, stderr):
+        self._stderr_handling_tasks.append(asyncio.ensure_future(self._handle_process_stderr_forever(stderr)))
 
-        A coroutine.
-        """
-        data = b""
-        psml_struct = None
-
-        if self._only_summaries:
-            # If summaries are read, we need the psdml structure which appears on top of the file.
-            while not psml_struct:
-                new_data = await fd.read(self.SUMMARIES_BATCH_SIZE)
-                data += new_data
-                psml_struct, data = self._extract_tag_from_data(data, b"structure")
-                if psml_struct:
-                    psml_struct = psml_structure_from_xml(psml_struct)
-                elif not new_data:
-                    return None, data
-            return psml_struct, data
-        else:
-            return None, data
-
-    async def _get_packet_from_stream(self, stream, existing_data, got_first_packet=True, psml_structure=None):
-        """A coroutine which returns a single packet if it can be read from the given StreamReader.
-
-        :return a tuple of (packet, remaining_data). The packet will be None if there was not enough XML data to create
-        a packet. remaining_data is the leftover data which was not enough to create a packet from.
-        :raises EOFError if EOF was reached.
-        """
-        # yield each packet in existing_data
-        if self.use_json:
-            packet, existing_data = self._extract_packet_json_from_data(existing_data,
-                                                                        got_first_packet=got_first_packet)
-        else:
-            packet, existing_data = self._extract_tag_from_data(existing_data)
-
-        if packet:
-            if self.use_json:
-                packet = packet_from_json_packet(packet, deduplicate_fields=self._json_has_duplicate_keys)
-            else:
-                packet = packet_from_xml_packet(packet, psml_structure=psml_structure)
-            return packet, existing_data
-
-        new_data = await stream.read(self.DEFAULT_BATCH_SIZE)
-        existing_data += new_data
-
-        if not new_data:
-            # Reached EOF
-            self._eof_reached = True
-            raise EOFError()
-        return None, existing_data
+    async def _handle_process_stderr_forever(self, stderr):
+        while True:
+            stderr_line = await stderr.readline()
+            if not stderr_line:
+                break
+            stderr_line = stderr_line.decode().strip()
+            self._last_error_line = stderr_line
+            self._log.debug(stderr_line)
 
     def _get_tshark_path(self):
         return get_process_path(self.tshark_path)
-
-    def _stderr_output(self):
-        # Ignore stderr output unless in debug mode (sent to console)
-        return None if self.debug else subprocess.DEVNULL
 
     def _get_tshark_version(self):
         if self.__tshark_version is None:
@@ -383,44 +326,54 @@ class Capture(object):
 
     async def _get_tshark_process(self, packet_count=None, stdin=None):
         """Returns a new tshark process with previously-set parameters."""
+        self._verify_capture_parameters()
+
         output_parameters = []
+        if self.use_json or self._use_ek:
+            if not tshark_supports_json(self._get_tshark_version()):
+                raise TSharkVersionException(
+                    "JSON only supported on Wireshark >= 2.2.0")
+
         if self.use_json:
             output_type = "json"
-            if not tshark_supports_json(self._get_tshark_version()):
-                raise TSharkVersionException("JSON only supported on Wireshark >= 2.2.0")
             if tshark_supports_duplicate_keys(self._get_tshark_version()):
                 output_parameters.append("--no-duplicate-keys")
-                self._json_has_duplicate_keys = False
+        elif self._use_ek:
+            output_type = "ek"
         else:
             output_type = "psml" if self._only_summaries else "pdml"
         parameters = [self._get_tshark_path(), "-l", "-n", "-T", output_type] + \
             self.get_parameters(packet_count=packet_count) + output_parameters
 
-        self._log.debug("Creating TShark subprocess with parameters: " + " ".join(parameters))
-        self._log.debug("Executable: %s" % parameters[0])
+        self._log.debug(
+            "Creating TShark subprocess with parameters: " + " ".join(parameters))
+        self._log.debug("Executable: %s", parameters[0])
         tshark_process = await asyncio.create_subprocess_exec(*parameters,
                                                               stdout=subprocess.PIPE,
-                                                              stderr=self._stderr_output(),
+                                                              stderr=subprocess.PIPE,
                                                               stdin=stdin)
+        self._create_stderr_handling_task(tshark_process.stderr)
         self._created_new_process(parameters, tshark_process)
         return tshark_process
 
     def _created_new_process(self, parameters, process, process_name="TShark"):
-        self._log.debug(process_name + " subprocess created")
+        self._log.debug(
+            process_name + f" subprocess (pid {process.pid}) created")
         if process.returncode is not None and process.returncode != 0:
             raise TSharkCrashException(
-                "%s seems to have crashed. Try updating it. (command ran: '%s')" % (
-                    process_name, " ".join(parameters)))
+                f"{process_name} seems to have crashed. Try updating it. (command ran: '{' '.join(parameters)}')")
         self._running_processes.add(process)
 
     async def _cleanup_subprocess(self, process):
         """Kill the given process and properly closes any pipes connected to it."""
+        self._log.debug(f"Cleanup Subprocess (pid {process.pid})")
         if process.returncode is None:
             try:
                 process.kill()
                 return await asyncio.wait_for(process.wait(), 1)
             except asyncTimeoutError:
-                self._log.debug("Waiting for process to close failed, may have zombie process.")
+                self._log.debug(
+                    "Waiting for process to close failed, may have zombie process.")
             except ProcessLookupError:
                 pass
             except OSError:
@@ -428,9 +381,18 @@ class Capture(object):
                     raise
         elif process.returncode > 0:
             if process.returncode != 1 or self._eof_reached:
-                raise TSharkCrashException("TShark seems to have crashed (retcode: %d). "
-                                           "Try rerunning in debug mode [ capture_obj.set_debug() ] or try updating tshark."
-                                           % process.returncode)
+                raise TSharkCrashException(f"TShark (pid {process.pid}) seems to have crashed (retcode: {process.returncode}).\n"
+                                           f"Last error line: {self._last_error_line}\n"
+                                           "Try rerunning in debug mode [ capture_obj.set_debug() ] or try updating tshark.")
+
+    def _setup_tshark_output_parser(self):
+        if self.use_json:
+            return tshark_json.TsharkJsonParser(self._get_tshark_version())
+        if self._use_ek:
+            ek_field_mapping.MAPPING.load_mapping(str(self._get_tshark_version()),
+                                                  tshark_path=self.tshark_path)
+            return tshark_ek.TsharkEkJsonParser()
+        return tshark_xml.TsharkXmlParser(parse_summaries=self._only_summaries)
 
     def close(self):
         self.eventloop.run_until_complete(self.close_async())
@@ -440,6 +402,12 @@ class Capture(object):
             await self._cleanup_subprocess(process)
         self._running_processes.clear()
 
+        # Wait for all stderr handling to finish
+        for task in self._stderr_handling_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     def __del__(self):
         if self._running_processes:
             self.close()
@@ -447,7 +415,9 @@ class Capture(object):
     def __enter__(self): return self
     async def __aenter__(self): return self
     def __exit__(self, exc_type, exc_val, exc_tb): self.close()
-    async def __aexit__(self, exc_type, exc_val, exc_tb): await self.close_async()
+
+    async def __aexit__(self, exc_type, exc_val,
+                        exc_tb): await self.close_async()
 
     def get_parameters(self, packet_count=None):
         """Returns the special tshark parameters to be used according to the configuration of this class."""
@@ -479,14 +449,15 @@ class Capture(object):
             for preference_name, preference_value in self._override_prefs.items():
                 if all(self.encryption) and preference_name in ("wlan.enable_decryption", "uat:80211_keys"):
                     continue  # skip if override preferences also given via --encryption options
-                params += ["-o", "{0}:{1}".format(preference_name, preference_value)]
+                params += ["-o", f"{preference_name}:{preference_value}"]
 
         if self._output_file:
             params += ["-w", self._output_file]
 
         if self._decode_as:
             for criterion, decode_as_proto in self._decode_as.items():
-                params += ["-d", ",".join([criterion.strip(), decode_as_proto.strip()])]
+                params += ["-d",
+                           ",".join([criterion.strip(), decode_as_proto.strip()])]
 
         if self._disable_protocol:
             params += ["--disable-protocol", self._disable_protocol.strip()]
@@ -500,4 +471,4 @@ class Capture(object):
             return self._packets_from_tshark_sync()
 
     def __repr__(self):
-        return "<%s (%d packets)>" % (self.__class__.__name__, len(self._packets))
+        return f"<{self.__class__.__name__} ({len(self._packets)} packets)>"
